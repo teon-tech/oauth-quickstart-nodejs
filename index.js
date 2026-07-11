@@ -11,32 +11,34 @@ const PORT = 3000;
 const refreshTokenStore = {};
 const accessTokenCache = new NodeCache({ deleteOnExpire: true });
 
-if (!process.env.CLIENT_ID || !process.env.CLIENT_SECRET) {
-    throw new Error('Missing CLIENT_ID or CLIENT_SECRET environment variable.')
-}
-
 //===========================================================================//
 //  HUBSPOT APP CONFIGURATION
 //
-//  All the following values must match configuration settings in your app.
-//  They will be used to build the OAuth URL, which users visit to begin
-//  installing. If they don't match your app's configuration, users will
-//  see an error page.
+//  client_id, client_secret, and scope can be provided per request as query
+//  params on /install (to support installing multiple different apps from
+//  this same server), or as environment variables, which are used as the
+//  default whenever a query param is not supplied.
+//===========================================================================//
 
-// Replace the following with the values from your app auth config, 
-// or set them as environment variables before running.
-const CLIENT_ID = process.env.CLIENT_ID;
-const CLIENT_SECRET = process.env.CLIENT_SECRET;
+const normalizeScopes = (scope) => (scope.split(/ |, ?|%20/)).join(' ');
 
-// Scopes for this app will default to `crm.objects.contacts.read`
-// To request others, set the SCOPE environment variable instead
-let SCOPES = ['crm.objects.contacts.read'];
-if (process.env.SCOPE) {
-    SCOPES = (process.env.SCOPE.split(/ |, ?|%20/)).join(' ');
-}
+// Resolves client_id, client_secret, and scope for a request, preferring
+// query params and falling back to the CLIENT_ID/CLIENT_SECRET/SCOPE
+// environment variables.
+const resolveOAuthParams = (req) => {
+    const clientId = req.query.client_id || process.env.CLIENT_ID;
+    const clientSecret = req.query.client_secret || process.env.CLIENT_SECRET;
+    const rawScope = req.query.scope || process.env.SCOPE || 'crm.objects.contacts.read';
+    const scopes = normalizeScopes(rawScope);
+    return { clientId, clientSecret, scopes };
+};
 
-// On successful install, users will be redirected to /oauth-callback
-const REDIRECT_URI = `http://localhost:${PORT}/oauth-callback`;
+// On successful install, users will be redirected to /oauth-callback.
+// BASE_URL should be set to your public URL (eg. https://your-app.example.com)
+// when deploying somewhere other than localhost; it must exactly match a
+// redirect URI configured in your HubSpot app's auth settings.
+const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+const REDIRECT_URI = `${BASE_URL}/oauth-callback`;
 
 //===========================================================================//
 
@@ -52,20 +54,28 @@ app.use(session({
 //================================//
 
 // Step 1
-// Build the authorization URL to redirect a user
-// to when they choose to install the app
-const authUrl =
-  'https://app.hubspot.com/oauth/authorize' +
-  `?client_id=${encodeURIComponent(CLIENT_ID)}` + // app's client ID
-  `&scope=${encodeURIComponent(SCOPES)}` + // scopes being requested by the app
-  `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}`; // where to send the user after the consent page
-
-// Redirect the user from the installation page to
-// the authorization URL
+// Build the authorization URL to redirect a user to when they choose to
+// install the app, and remember which client_id/client_secret this
+// installation is for so /oauth-callback can complete the exchange (HubSpot
+// does not send the client_secret back on the callback).
 app.get('/install', (req, res) => {
   console.log('');
   console.log('=== Initiating OAuth 2.0 flow with HubSpot ===');
   console.log('');
+
+  const { clientId, clientSecret, scopes } = resolveOAuthParams(req);
+  if (!clientId || !clientSecret) {
+    return res.redirect('/error?msg=Missing client_id or client_secret (pass as query params or set CLIENT_ID/CLIENT_SECRET env vars)');
+  }
+
+  req.session.oauth = { clientId, clientSecret };
+
+  const authUrl =
+    'https://app.hubspot.com/oauth/authorize' +
+    `?client_id=${encodeURIComponent(clientId)}` + // app's client ID
+    `&scope=${encodeURIComponent(scopes)}` + // scopes being requested by the app
+    `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}`; // where to send the user after the consent page
+
   console.log("===> Step 1: Redirecting user to your app's OAuth URL");
   res.redirect(authUrl);
   console.log('===> Step 2: User is being prompted for consent by HubSpot');
@@ -87,10 +97,15 @@ app.get('/oauth-callback', async (req, res) => {
   if (req.query.code) {
     console.log('       > Received an authorization token');
 
+    const oauthSession = req.session.oauth;
+    if (!oauthSession) {
+      return res.redirect('/error?msg=No pending installation found for this session. Start at /install.');
+    }
+
     const authCodeProof = {
       grant_type: 'authorization_code',
-      client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET,
+      client_id: oauthSession.clientId,
+      client_secret: oauthSession.clientSecret,
       redirect_uri: REDIRECT_URI,
       code: req.query.code
     };
@@ -121,7 +136,15 @@ const exchangeForTokens = async (userId, exchangeProof) => {
     // Usually, this token data should be persisted in a database and associated with
     // a user identity.
     const tokens = JSON.parse(responseBody);
-    refreshTokenStore[userId] = tokens.refresh_token;
+    // Keep the client_id/client_secret alongside the refresh token so a later
+    // refresh (see refreshAccessToken) uses the credentials of the app this
+    // session was installed with, since multiple apps can be installed from
+    // this same server.
+    refreshTokenStore[userId] = {
+      refreshToken: tokens.refresh_token,
+      clientId: exchangeProof.client_id,
+      clientSecret: exchangeProof.client_secret
+    };
     accessTokenCache.set(userId, tokens.access_token, Math.round(tokens.expires_in * 0.75));
 
     console.log('       > Received an access token and refresh token');
@@ -133,12 +156,13 @@ const exchangeForTokens = async (userId, exchangeProof) => {
 };
 
 const refreshAccessToken = async (userId) => {
+  const { clientId, clientSecret, refreshToken } = refreshTokenStore[userId];
   const refreshTokenProof = {
     grant_type: 'refresh_token',
-    client_id: CLIENT_ID,
-    client_secret: CLIENT_SECRET,
+    client_id: clientId,
+    client_secret: clientSecret,
     redirect_uri: REDIRECT_URI,
-    refresh_token: refreshTokenStore[userId]
+    refresh_token: refreshToken
   };
   return await exchangeForTokens(userId, refreshTokenProof);
 };

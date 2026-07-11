@@ -12,6 +12,17 @@ _**Note:** This app does not store any data in a persistent way, so restarting t
    HubSpot's server. Here you will choose which account you'd like to install the app in and give consent for it to act
    on your behalf. When this is complete, HubSpot will redirect you back to the app.
 
+   `client_id`, `client_secret`, and `scope` can be provided either as query params on `/install` (useful for
+   installing multiple different HubSpot apps from the same running server) or as environment variables, which
+   are used as the default whenever a query param isn't supplied:
+   ```
+   http://localhost:3000/install?client_id=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx&client_secret=yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy&scope=crm.objects.contacts.read
+   ```
+   **Security note:** sending `client_secret` as a query param on a `GET` request can expose it in browser
+   history, server access logs, and the `Referer` header. That's an acceptable trade-off for this local
+   quickstart, but avoid this pattern in a production app — prefer sending sensitive values in a request body,
+   the same way the token exchange in step 2 already does.
+
 2. **Exchange an authorization code for access tokens**
 
    Now that you're back in the app, it will retrieve an access token and a refresh token from HubSpot's server, using an
@@ -53,9 +64,20 @@ _**Note:** You must be a super-admin for the account that you want to install th
    CLIENT_SECRET='yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy'
    SCOPE='crm.objects.contacts.read,forms'
    ```
-   The `SCOPE` environment variable is optional in this example. 
-   If not set, this application will use the scope `crm.objects.contacts.read`.
+   `CLIENT_ID`, `CLIENT_SECRET`, and `SCOPE` in the `.env` file are all optional — they're only used as
+   defaults for whichever of `client_id`, `client_secret`, or `scope` aren't passed as query params on
+   `/install` (see step 1 above). If neither is provided, `SCOPE` defaults to `crm.objects.contacts.read`.
    The scopes can be separated by a comma, space, or URL-encoded space (`%20`)
+
+   By default the app builds its OAuth redirect URI as `http://localhost:3000/oauth-callback`. If you're
+   deploying this app somewhere with a real domain rather than running it locally, set `BASE_URL` to your
+   app's public URL, eg:
+   ```
+   BASE_URL='https://your-app.example.com'
+   ```
+   The app will then use `https://your-app.example.com/oauth-callback` as its redirect URI. This must exactly
+   match a redirect URI configured in your HubSpot app's auth settings, or HubSpot will reject the
+   authorization request.
 3. From the root of the repository, run:
    ```bash
    $ yarn install
