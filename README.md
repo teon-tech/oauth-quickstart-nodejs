@@ -34,10 +34,13 @@ as form URL-encoded data rather than as query parameters. The OAuth v3 endpoints
 request body rather than as URL parameters, preventing them from appearing in 
 server logs.
 
-4. **Retrieve a contact**
+4. **Confirm the install**
 
-   When the app has received an access token, it will redirect you to `http://localhost:3000/`. It will then use the access token to
-   make a query to HubSpot's Contacts API and display the retrieved contact's name on the page.
+   When the app has received an access token, it will redirect you to `http://localhost:3000/`, which shows
+   whether the app is installed for the current session ("Status: app installed" / "Status: app not
+   installed"). It does not make any further calls to HubSpot's API — `getContact` in `index.js` is left in
+   as an example of how to make an authenticated API call using the stored access token, if you want to add
+   that back.
    
 ## Prerequisites
 
@@ -100,3 +103,38 @@ $ docker build -t hs-oauth-quickstart:latest git://github.com/HubSpot/oauth-quic
 ```
 $ docker run --init -it -p 3000:3000 -e CLIENT_SECRET=$CLIENT_SECRET -e CLIENT_ID=$CLIENT_ID -e SCOPE=contacts,forms hs-oauth-quickstart:latest
 ```
+
+---
+
+## Option 3: Deploying to Vercel
+
+The app is exported as a serverless function (`module.exports = app` in `index.js`) and routed via
+`vercel.json`, so it can be deployed directly with the [Vercel CLI](https://vercel.com/docs/cli):
+
+1. Install the CLI and log in (skip if already set up):
+   ```bash
+   $ npm i -g vercel
+   $ vercel login
+   ```
+2. From the root of the repository, deploy:
+   ```bash
+   $ vercel deploy --prod
+   ```
+3. In the Vercel project's dashboard, under **Settings → Environment Variables**, set:
+   - `CLIENT_ID`, `CLIENT_SECRET`, `SCOPE` — same as the `.env` values described above (optional; can also be
+     passed as `/install` query params instead).
+   - `BASE_URL` — the deployment's public URL, eg. `https://your-project.vercel.app` (see `.env.example`).
+   - `SESSION_SECRET` — any random string, so the session cookie's signing secret is stable across
+     invocations of the same warm serverless instance.
+   
+   Redeploy after setting these so they take effect.
+4. In your HubSpot app's auth settings, add `https://your-project.vercel.app/oauth-callback` as a valid
+   redirect URI (must exactly match `BASE_URL` + `/oauth-callback`).
+
+**Important caveat:** `refreshTokenStore`, `accessTokenCache`, and the session store are all kept in the
+serverless function's in-memory process, not in an external store. Vercel does not guarantee that the
+`/install` → `/oauth-callback` round trip (or later visits to `/`) land on the same warm instance, so this
+setup is only reliable for light, infrequent use where a warm instance is likely to be reused — under heavier
+or concurrent traffic you may intermittently see "No pending installation found for this session" or lose
+cached tokens across requests. If that starts happening, move session/token storage to an external store
+(eg. Vercel KV / Upstash Redis).

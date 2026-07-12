@@ -42,9 +42,11 @@ const REDIRECT_URI = `${BASE_URL}/oauth-callback`;
 
 //===========================================================================//
 
-// Use a session to keep track of client ID
+// Use a session to keep track of client ID.
+// SESSION_SECRET can be set explicitly (recommended on Vercel) so the signing
+// secret stays stable instead of being randomized on every cold start.
 app.use(session({
-  secret: Math.random().toString(36).substring(2),
+  secret: process.env.SESSION_SECRET || Math.random().toString(36).substring(2),
   resave: false,
   saveUninitialized: true
 }));
@@ -68,17 +70,27 @@ app.get('/install', (req, res) => {
     return res.redirect('/error?msg=Missing client_id or client_secret (pass as query params or set CLIENT_ID/CLIENT_SECRET env vars)');
   }
 
-  req.session.oauth = { clientId, clientSecret };
+  // Start a brand new session for this install attempt so it can never
+  // inherit the "installed" status left over from a previous install in this
+  // same browser (eg. testing a second app, or retrying after canceling
+  // consent on HubSpot's page).
+  req.session.regenerate((err) => {
+    if (err) {
+      return res.redirect('/error?msg=Could not start a new session for this install attempt');
+    }
 
-  const authUrl =
-    'https://app.hubspot.com/oauth/authorize' +
-    `?client_id=${encodeURIComponent(clientId)}` + // app's client ID
-    `&scope=${encodeURIComponent(scopes)}` + // scopes being requested by the app
-    `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}`; // where to send the user after the consent page
+    req.session.oauth = { clientId, clientSecret };
 
-  console.log("===> Step 1: Redirecting user to your app's OAuth URL");
-  res.redirect(authUrl);
-  console.log('===> Step 2: User is being prompted for consent by HubSpot');
+    const authUrl =
+      'https://app.hubspot.com/oauth/authorize' +
+      `?client_id=${encodeURIComponent(clientId)}` + // app's client ID
+      `&scope=${encodeURIComponent(scopes)}` + // scopes being requested by the app
+      `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}`; // where to send the user after the consent page
+
+    console.log("===> Step 1: Redirecting user to your app's OAuth URL");
+    res.redirect(authUrl);
+    console.log('===> Step 2: User is being prompted for consent by HubSpot');
+  });
 });
 
 // Step 2
@@ -91,6 +103,15 @@ app.get('/install', (req, res) => {
 // and process it based on the query parameters that are passed
 app.get('/oauth-callback', async (req, res) => {
   console.log('===> Step 3: Handling the request sent by the server');
+
+  // HubSpot redirects here with ?error=... (eg. the app's configured scopes
+  // or redirect_uri don't match what was requested) instead of ?code=... when
+  // it can't proceed with the install — sometimes before the user even gets
+  // to click "Connect app". Handle that explicitly instead of hanging.
+  if (req.query.error) {
+    console.error(`       > HubSpot returned an OAuth error: ${req.query.error} - ${req.query.error_description || ''}`);
+    return res.redirect(`/error?msg=${encodeURIComponent(req.query.error_description || req.query.error)}`);
+  }
 
   // Received a user authorization code, so now combine that with the other
   // required values and exchange both for an access token and a refresh token
@@ -120,8 +141,10 @@ app.get('/oauth-callback', async (req, res) => {
 
     // Once the tokens have been retrieved, use them to make a query
     // to the HubSpot API
-    res.redirect(`/`);
+    return res.redirect(`/`);
   }
+
+  res.redirect('/error?msg=' + encodeURIComponent('HubSpot did not send an authorization code or error.'));
 });
 
 //==========================================//
@@ -219,16 +242,60 @@ const displayContactName = (res, contact) => {
   res.write(`<p>Contact name: ${firstname.value} ${lastname.value}</p>`);
 };
 
-app.get('/', async (req, res) => {
+const escapeHtml = (str) => String(str).replace(/[&<>"']/g, (c) => ({
+  '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+}[c]));
+
+app.get('/', (req, res) => {
   res.setHeader('Content-Type', 'text/html');
   res.write(`<h2>HubSpot OAuth 2.0 Quickstart App</h2>`);
   if (isAuthorized(req.sessionID)) {
-    const accessToken = await getAccessToken(req.sessionID);
-    const contact = await getContact(accessToken);
-    res.write(`<h4>Access token: ${accessToken}</h4>`);
-    displayContactName(res, contact);
+    const installedClientId = refreshTokenStore[req.sessionID].clientId;
+    res.write(`<h3>Status: app installed</h3><p></p>`);
   } else {
-    res.write(`<a href="/install"><h3>Install the app</h3></a>`);
+    res.write(`
+      <h3>Status: app not installed</h3>
+      <h3>Generate an install link</h3>
+      <p><small>Fill these in and generate a link to send to your client — they just need to click it, they
+      won't see this form.</small></p>
+      <form id="install-form">
+        <div>
+          <label for="client_id">Client ID</label><br/>
+          <input type="text" id="client_id" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" size="50" />
+        </div>
+        <div>
+          <label for="client_secret">Client Secret</label><br/>
+          <input type="password" id="client_secret" placeholder="yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" size="50" />
+        </div>
+        <div>
+          <label for="scope">Scope</label><br/>
+          <input type="text" id="scope" placeholder="crm.objects.contacts.read" size="50" />
+        </div>
+        <br/>
+        <button type="submit">Generate install link</button>
+      </form>
+      <p><small>Leave a field blank to fall back to its CLIENT_ID/CLIENT_SECRET/SCOPE environment variable.</small></p>
+      <div id="install-url-wrapper" style="display:none">
+        <label for="install-url">Send this link to your client:</label><br/>
+        <input type="text" id="install-url" size="80" readonly onclick="this.select()" />
+      </div>
+      <script>
+        document.getElementById('install-form').addEventListener('submit', function (e) {
+          e.preventDefault();
+          var params = new URLSearchParams();
+          ['client_id', 'client_secret', 'scope'].forEach(function (field) {
+            var value = document.getElementById(field).value.trim();
+            if (value) params.set(field, value);
+          });
+          var query = params.toString();
+          var url = window.location.origin + '/install' + (query ? ('?' + query) : '');
+          var input = document.getElementById('install-url');
+          input.value = url;
+          document.getElementById('install-url-wrapper').style.display = 'block';
+          input.select();
+        });
+      </script>
+    `);
   }
   res.end();
 });
@@ -239,5 +306,11 @@ app.get('/error', (req, res) => {
   res.end();
 });
 
-app.listen(PORT, () => console.log(`=== Starting your app on http://localhost:${PORT} ===`));
-opn(`http://localhost:${PORT}`);
+// On Vercel, the app is imported as a serverless function handler (see
+// module.exports below) instead of listening on a port itself.
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => console.log(`=== Starting your app on http://localhost:${PORT} ===`));
+  opn(`http://localhost:${PORT}`);
+}
+
+module.exports = app;

@@ -57,3 +57,6 @@ typings/
 # dotenv environment variables file
 .env
 
+# Vercel CLI local project link/config
+.vercel
+
